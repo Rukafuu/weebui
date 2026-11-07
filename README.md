@@ -1,12 +1,22 @@
-# gpui-vrm
+<p align="center">
+  <img src="assets/logo.svg" alt="WeebUI Logo" width="680" />
+</p>
 
-[![Crates.io](https://img.shields.io/crates/v/gpui-vrm.svg)](https://crates.io/crates/gpui-vrm)
-[![Documentation](https://docs.rs/gpui-vrm/badge.svg)](https://docs.rs/gpui-vrm)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+<p align="center">
+  <strong>Native 3D Anime Avatar &amp; VRM Companion Framework for GPUI</strong>
+</p>
 
-A native 100% Rust 3D avatar and animation engine for **GPUI** (the GPU-accelerated UI framework developed by Zed Industries).
+<p align="center">
+  <a href="https://crates.io/crates/gpui-vrm"><img src="https://img.shields.io/crates/v/gpui-vrm.svg" alt="Crates.io" /></a>
+  <a href="https://docs.rs/gpui-vrm"><img src="https://docs.rs/gpui-vrm/badge.svg" alt="Documentation" /></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License" /></a>
+</p>
 
-`gpui-vrm` brings full **VRM 0.x / 1.0** and **glTF 2.0** support to GPUI applications with hardware-accelerated **WGPU** offscreen rendering, **MToon anime cel-shading**, **VRMA skeletal animation retargeting**, **Verlet spring bone physics** (hair and cloth), **morph target facial blendshapes**, and **audio-driven lip-sync**.
+---
+
+**WeebUI** (`gpui-vrm`) is a 100% native Rust 3D anime avatar and companion runtime for **GPUI** (the blazing-fast, GPU-accelerated UI framework developed by Zed Industries).
+
+It brings full **VRM 0.x / 1.0** and **glTF 2.0** support to GPUI applications with hardware-accelerated **WGPU** offscreen rendering, **MToon anime cel-shading**, **VRMA skeletal animation retargeting**, **Verlet spring bone physics** (hair and cloth), **morph target facial blendshapes**, and **audio-driven lip-sync**.
 
 ---
 
