@@ -2,6 +2,13 @@ use std::collections::HashMap;
 
 use crate::loader::VrmModelData;
 
+/// Tempo de vida de uma expressão manual, na mesma janela usada pela web (~4,5 s).
+/// Sem isso, cada `set_expression` de um turno ficava ligado para sempre e os
+/// símbolos da cabeça se acumulavam.
+const MANUAL_EXPRESSION_TTL_SEC: f32 = 4.5;
+/// Últimos segundos em que o peso decai até zero, para não "piscar" de volta.
+const MANUAL_EXPRESSION_FADE_SEC: f32 = 0.4;
+
 /// Item de agendamento de visema labial (portado de `usami/src/visemes.js`).
 #[derive(Debug, Clone)]
 pub struct VisemeSlot {
@@ -69,6 +76,8 @@ pub struct ExpressionDriver {
 
     // Overrides manuais de expressões
     manual_weights: HashMap<String, f32>,
+    /// Tempo restante (segundos) de cada expressão manual até ser liberada.
+    manual_ttl: HashMap<String, f32>,
 
     // Sistema de piscar natural (Auto-Blink)
     blink_timer: f32,
@@ -139,6 +148,7 @@ impl ExpressionDriver {
             emotion_eyes_closed: false,
             emotion_ttl: 0.0,
             manual_weights: HashMap::new(),
+            manual_ttl: HashMap::new(),
             blink_timer: 2.6,
             blink_phase: 0.0,
             is_blinking: false,
@@ -166,13 +176,16 @@ impl ExpressionDriver {
         let key = name.to_lowercase();
         if weight.abs() < 1e-4 {
             self.manual_weights.remove(&key);
+            self.manual_ttl.remove(&key);
         } else {
-            self.manual_weights.insert(key, weight.clamp(0.0, 1.0));
+            self.manual_weights.insert(key.clone(), weight.clamp(0.0, 1.0));
+            self.manual_ttl.insert(key, MANUAL_EXPRESSION_TTL_SEC);
         }
     }
 
     pub fn clear_manual_expressions(&mut self) {
         self.manual_weights.clear();
+        self.manual_ttl.clear();
     }
 
     /// Aplica uma emoção semântica (suporta presets VRM 0.x / 1.0 e apelidos customizados).
@@ -278,6 +291,20 @@ impl ExpressionDriver {
             }
         }
 
+        // 1.5. Decaimento de TTL das expressões manuais (evita acúmulo entre turnos)
+        if !self.manual_ttl.is_empty() {
+            let weights = &mut self.manual_weights;
+            self.manual_ttl.retain(|key, ttl| {
+                *ttl -= dt;
+                if *ttl <= 0.0 {
+                    weights.remove(key);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
         // Interpolação suave dos pesos de emoção (attack rápido, release suave)
         let mut all_emotion_keys: Vec<String> = self
             .current_emotion_weights
@@ -374,7 +401,15 @@ impl ExpressionDriver {
             Self::apply_weight_to_meshes(&self.name_to_binds, &mut self.mesh_target_weights, key, w);
         }
         for (key, &w) in &self.manual_weights {
-            Self::apply_weight_to_meshes(&self.name_to_binds, &mut self.mesh_target_weights, key, w);
+            // Decai suavemente nos últimos instantes antes do vencimento.
+            let ttl = self.manual_ttl.get(key).copied().unwrap_or(0.0);
+            let fade = (ttl / MANUAL_EXPRESSION_FADE_SEC).clamp(0.0, 1.0);
+            Self::apply_weight_to_meshes(
+                &self.name_to_binds,
+                &mut self.mesh_target_weights,
+                key,
+                w * fade,
+            );
         }
         if blink_weight > 0.001 {
             if !Self::apply_weight_to_meshes(
@@ -756,5 +791,76 @@ pub fn resolve_emotion_config(raw_tag: &str) -> EmotionConfig {
             eyes_closed: false,
             suggested_vrma: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_model() -> VrmModelData {
+        VrmModelData {
+            title: String::new(),
+            is_vrm0: false,
+            nodes: Vec::new(),
+            root_nodes: Vec::new(),
+            topological_order: Vec::new(),
+            skins: Vec::new(),
+            meshes: Vec::new(),
+            materials: Vec::new(),
+            textures: Vec::new(),
+            humanoid_bones: HashMap::new(),
+            blend_shape_groups: Vec::new(),
+            spring_colliders: Vec::new(),
+            spring_bone_groups: Vec::new(),
+            auto_scale: 1.0,
+            auto_offset: glam::Vec3::ZERO,
+        }
+    }
+
+    fn advance(driver: &mut ExpressionDriver, seconds: f32) {
+        // `update` limita o dt a 0.1 s, então avançamos em passos.
+        let steps = (seconds / 0.1).round() as usize;
+        for _ in 0..steps {
+            driver.update(0.1);
+        }
+    }
+
+    #[test]
+    fn manual_expression_expires_after_ttl() {
+        let mut driver = ExpressionDriver::new(&empty_model());
+        driver.set_expression("happy", 1.0);
+
+        advance(&mut driver, 4.0);
+        assert!(driver.manual_weights.contains_key("happy"));
+
+        advance(&mut driver, 1.0);
+        assert!(driver.manual_weights.is_empty());
+        assert!(driver.manual_ttl.is_empty());
+    }
+
+    #[test]
+    fn setting_again_refreshes_ttl() {
+        let mut driver = ExpressionDriver::new(&empty_model());
+        driver.set_expression("happy", 1.0);
+
+        advance(&mut driver, 4.0);
+        driver.set_expression("happy", 1.0);
+
+        advance(&mut driver, 4.0);
+        assert!(driver.manual_weights.contains_key("happy"));
+
+        advance(&mut driver, 1.0);
+        assert!(driver.manual_weights.is_empty());
+    }
+
+    #[test]
+    fn clearing_removes_weights_and_ttls() {
+        let mut driver = ExpressionDriver::new(&empty_model());
+        driver.set_expression("happy", 1.0);
+        driver.clear_manual_expressions();
+
+        assert!(driver.manual_weights.is_empty());
+        assert!(driver.manual_ttl.is_empty());
     }
 }

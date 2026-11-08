@@ -274,6 +274,7 @@ impl VrmRenderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 8,
             ..Default::default()
         });
 
@@ -796,37 +797,84 @@ fn create_rgba_texture_view(
     height: u32,
     rgba: &[u8],
 ) -> wgpu::TextureView {
+    let width = width.max(1);
+    let height = height.max(1);
+    // A cadeia de mips evita aliasing em superfícies minificadas e oblíquas
+    // (ex.: acabamento e padrões das mangas), que sem mipmap serrilham.
+    let mip_level_count = 32 - width.max(height).leading_zeros();
     let size = wgpu::Extent3d {
-        width: width.max(1),
-        height: height.max(1),
+        width,
+        height,
         depth_or_array_layers: 1,
     };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("vrm_tex"),
         size,
-        mip_level_count: 1,
+        mip_level_count,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width.max(1)),
-            rows_per_image: Some(height.max(1)),
-        },
-        size,
-    );
+
+    let mut level_data = rgba.to_vec();
+    let (mut level_w, mut level_h) = (width, height);
+    for level in 0..mip_level_count {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &level_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * level_w),
+                rows_per_image: Some(level_h),
+            },
+            wgpu::Extent3d {
+                width: level_w,
+                height: level_h,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        if level + 1 < mip_level_count {
+            let (next, next_w, next_h) = downsample_rgba(&level_data, level_w, level_h);
+            level_data = next;
+            level_w = next_w;
+            level_h = next_h;
+        }
+    }
+
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Box filter 2x2 para gerar o próximo nível de mipmap no CPU.
+fn downsample_rgba(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
+    let next_w = (width / 2).max(1);
+    let next_h = (height / 2).max(1);
+    let mut dst = vec![0u8; (next_w * next_h * 4) as usize];
+
+    for y in 0..next_h {
+        let y0 = (y * 2).min(height - 1);
+        let y1 = (y * 2 + 1).min(height - 1);
+        for x in 0..next_w {
+            let x0 = (x * 2).min(width - 1);
+            let x1 = (x * 2 + 1).min(width - 1);
+            for c in 0..4usize {
+                let sum = src[((y0 * width + x0) * 4) as usize + c] as u32
+                    + src[((y0 * width + x1) * 4) as usize + c] as u32
+                    + src[((y1 * width + x0) * 4) as usize + c] as u32
+                    + src[((y1 * width + x1) * 4) as usize + c] as u32;
+                dst[((y * next_w + x) * 4) as usize + c] = (sum / 4) as u8;
+            }
+        }
+    }
+
+    (dst, next_w, next_h)
 }
 
 fn create_render_targets(device: &wgpu::Device, width: u32, height: u32) -> RenderTargets {
