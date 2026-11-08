@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec3, Vec4};
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
@@ -54,6 +54,7 @@ struct GpuPrimitive {
     alpha_mode: AlphaMode,
     cull_mode: CullMode,
     has_outline: bool,
+    world_center: Vec3,
 }
 
 struct GpuMesh {
@@ -95,11 +96,11 @@ pub struct CameraState {
 
 impl Default for CameraState {
     fn default() -> Self {
-        // Enquadramento padrão de busto/corpo da Usami no Stage Card
+        // Enquadramento de corpo inteiro calibrado com Usami.jsx
         Self {
-            fov_y_deg: 28.0,
-            position: Vec3::new(0.0, 1.38, 3.35),
-            target: Vec3::new(0.0, 1.28, 0.0),
+            fov_y_deg: 30.0,
+            position: Vec3::new(0.0, 1.15, 4.4),
+            target: Vec3::new(0.0, 1.15, 0.0),
             near: 0.05,
             far: 100.0,
         }
@@ -122,7 +123,8 @@ pub struct VrmRenderer {
 
     gpu_meshes: Vec<GpuMesh>,
     gpu_materials: Vec<GpuMaterialBind>,
-    draw_order: Vec<(usize, usize)>, // (gpu_mesh_idx, prim_idx) ordenados por render_queue
+    opaque_draw_order: Vec<(usize, usize)>, // (gpu_mesh_idx, prim_idx) Opaque e Mask
+    blend_primitives: Vec<(usize, usize)>,  // (gpu_mesh_idx, prim_idx) Blend
     targets: RenderTargets,
 }
 
@@ -365,7 +367,18 @@ impl VrmRenderer {
 
         // 6. Malhas e Primitivas na GPU
         let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
-        let mut draw_order = Vec::new();
+
+        let root_rot = if model.is_vrm0 {
+            Quat::from_rotation_y(std::f32::consts::PI)
+        } else {
+            Quat::IDENTITY
+        };
+        let rotated_offset = root_rot * model.auto_offset;
+        let root_mat = Mat4::from_scale_rotation_translation(
+            Vec3::splat(model.auto_scale),
+            root_rot,
+            rotated_offset,
+        );
 
         for (m_idx, mesh) in model.meshes.iter().enumerate() {
             let vcount = mesh.base_positions.len();
@@ -403,7 +416,7 @@ impl VrmRenderer {
             });
 
             let mut primitives = Vec::with_capacity(mesh.primitives.len());
-            for (p_idx, prim) in mesh.primitives.iter().enumerate() {
+            for (_p_idx, prim) in mesh.primitives.iter().enumerate() {
                 let index_buffer = create_init_buffer(
                     &device,
                     bytemuck::cast_slice(&prim.indices),
@@ -411,6 +424,27 @@ impl VrmRenderer {
                 );
                 let mat_idx = prim.material_index.min(model.materials.len() - 1);
                 let mat = &model.materials[mat_idx];
+
+                let mut min = Vec3::splat(f32::INFINITY);
+                let mut max = Vec3::splat(f32::NEG_INFINITY);
+                for &idx in &prim.indices {
+                    if let Some(&pos) = mesh.base_positions.get(idx as usize) {
+                        min = min.min(pos);
+                        max = max.max(pos);
+                    }
+                }
+                let local_center = if min.x.is_finite() && max.x.is_finite() {
+                    (min + max) * 0.5
+                } else {
+                    Vec3::ZERO
+                };
+                let world_center = if mesh.skin_index.is_some() {
+                    root_mat.transform_point3(local_center)
+                } else {
+                    let node_world = model.nodes[mesh.node_index].rest_world_matrix;
+                    (root_mat * node_world).transform_point3(local_center)
+                };
+
                 primitives.push(GpuPrimitive {
                     index_buffer,
                     index_count: prim.indices.len() as u32,
@@ -419,8 +453,8 @@ impl VrmRenderer {
                     alpha_mode: mat.alpha_mode,
                     cull_mode: mat.cull_mode,
                     has_outline: gpu_materials[mat_idx].outline_bind_group.is_some(),
+                    world_center,
                 });
-                draw_order.push((m_idx, p_idx));
             }
 
             gpu_meshes.push(GpuMesh {
@@ -435,8 +469,21 @@ impl VrmRenderer {
             });
         }
 
-        // Ordena primitivas: Opaque -> Mask -> Blend, respeitando render_queue do MToon
-        draw_order.sort_by_key(|&(m_idx, p_idx)| {
+        // Separa primitivas Opaque / Mask de Blend
+        let mut opaque_draw_order = Vec::new();
+        let mut blend_primitives = Vec::new();
+        for (m_idx, mesh) in gpu_meshes.iter().enumerate() {
+            for (p_idx, prim) in mesh.primitives.iter().enumerate() {
+                if prim.alpha_mode == AlphaMode::Blend {
+                    blend_primitives.push((m_idx, p_idx));
+                } else {
+                    opaque_draw_order.push((m_idx, p_idx));
+                }
+            }
+        }
+
+        // Ordena primitivas opacas: Opaque -> Mask, respeitando render_queue do MToon
+        opaque_draw_order.sort_by_key(|&(m_idx, p_idx)| {
             let p = &gpu_meshes[m_idx].primitives[p_idx];
             let cat = match p.alpha_mode {
                 AlphaMode::Opaque => 0,
@@ -461,7 +508,8 @@ impl VrmRenderer {
             pipeline_blend_none,
             gpu_meshes,
             gpu_materials,
-            draw_order,
+            opaque_draw_order,
+            blend_primitives,
             targets,
         })
     }
@@ -607,10 +655,7 @@ impl VrmRenderer {
 
             rpass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            for &(m_idx, p_idx) in &self.draw_order {
-                if !model.meshes[m_idx].visible {
-                    continue;
-                }
+            let draw_primitive = |rpass: &mut wgpu::RenderPass, m_idx: usize, p_idx: usize| {
                 let gpu_mesh = &self.gpu_meshes[m_idx];
                 let prim = &gpu_mesh.primitives[p_idx];
                 let gpu_mat = &self.gpu_materials[prim.material_index];
@@ -638,6 +683,35 @@ impl VrmRenderer {
                         rpass.draw_indexed(0..prim.index_count, 0, 0..1);
                     }
                 }
+            };
+
+            // 1. Passada de primitivas Opaque e Mask (escrevem depth buffer)
+            for &(m_idx, p_idx) in &self.opaque_draw_order {
+                if !model.meshes[m_idx].visible {
+                    continue;
+                }
+                draw_primitive(&mut rpass, m_idx, p_idx);
+            }
+
+            // 2. Passada de primitivas Blend ordenadas dinamicamente back-to-front
+            let cam_pos = self.camera.position;
+            let mut sorted_blends = self.blend_primitives.clone();
+            sorted_blends.retain(|&(m_idx, _)| model.meshes[m_idx].visible);
+            sorted_blends.sort_by(|&(m_a, p_a), &(m_b, p_b)| {
+                let prim_a = &self.gpu_meshes[m_a].primitives[p_a];
+                let prim_b = &self.gpu_meshes[m_b].primitives[p_b];
+                if prim_a.render_queue != prim_b.render_queue {
+                    prim_a.render_queue.cmp(&prim_b.render_queue)
+                } else {
+                    let dist_a = (prim_a.world_center - cam_pos).length_squared();
+                    let dist_b = (prim_b.world_center - cam_pos).length_squared();
+                    // Back-to-front: maior distância vem PRIMEIRO
+                    dist_b.partial_cmp(&dist_a).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            });
+
+            for (m_idx, p_idx) in sorted_blends {
+                draw_primitive(&mut rpass, m_idx, p_idx);
             }
         }
 

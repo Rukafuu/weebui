@@ -64,6 +64,7 @@ enum VrmCommand {
     },
     SetSpringBoneEnabled(bool),
     SetArmClearanceDeg(f32),
+    ResetCamera,
 }
 
 #[derive(Default)]
@@ -196,6 +197,11 @@ impl VrmController {
         });
     }
 
+    /// Restaura a câmera orbital para a posição padrão de enquadramento de corpo inteiro.
+    pub fn reset_camera(&self) {
+        self.shared.lock().commands.push(VrmCommand::ResetCamera);
+    }
+
     pub fn set_spring_bone_enabled(&self, enabled: bool) {
         self.shared
             .lock()
@@ -280,9 +286,9 @@ impl VrmView {
             last_bounds: Arc::new(Mutex::new(None)),
             was_speaking: false,
             orbit_yaw: 0.0,
-            orbit_pitch: 0.04,
-            orbit_distance: 2.85,
-            camera_target_y: 1.34,
+            orbit_pitch: 0.0,
+            orbit_distance: 4.4,
+            camera_target_y: 1.15,
             last_drag_pos: None,
         };
 
@@ -450,7 +456,7 @@ impl VrmView {
                 } => {
                     self.orbit_yaw = (self.orbit_yaw + yaw_delta).clamp(-1.2, 1.2);
                     self.orbit_pitch = (self.orbit_pitch + pitch_delta).clamp(-0.45, 0.65);
-                    self.orbit_distance = (self.orbit_distance + zoom_delta).clamp(1.2, 5.5);
+                    self.orbit_distance = (self.orbit_distance + zoom_delta).clamp(1.2, 6.5);
                     self.sync_orbit_camera();
                 }
                 VrmCommand::SetSpringBoneEnabled(enabled) => {
@@ -458,6 +464,13 @@ impl VrmView {
                 }
                 VrmCommand::SetArmClearanceDeg(deg) => {
                     self.skeleton.arm_clearance_deg = deg.clamp(0.0, 45.0);
+                }
+                VrmCommand::ResetCamera => {
+                    self.orbit_yaw = 0.0;
+                    self.orbit_pitch = 0.0;
+                    self.orbit_distance = 4.4;
+                    self.camera_target_y = 1.15;
+                    self.sync_orbit_camera();
                 }
             }
         }
@@ -562,7 +575,7 @@ impl Render for VrmView {
                     ScrollDelta::Pixels(p) => p.y.into(),
                     ScrollDelta::Lines(l) => l.y * 24.0,
                 };
-                this.orbit_distance = (this.orbit_distance - delta_y * 0.003).clamp(1.25, 5.2);
+                this.orbit_distance = (this.orbit_distance - delta_y * 0.003).clamp(1.2, 6.5);
                 this.sync_orbit_camera();
             }))
             .child(
