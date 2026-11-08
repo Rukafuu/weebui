@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="WeebUI Logo" width="680" />
+  <img src="assets/weebui-icon.png" alt="WeebUI Logo" width="240" />
 </p>
+
+<h1 align="center">WeebUI</h1>
 
 <p align="center">
   <strong>Native 3D Anime Avatar &amp; VRM Companion Framework for GPUI</strong>
