@@ -343,7 +343,7 @@ impl VrmView {
             "idle" => "aidelle_Idle.vrma",
             "relax" | "idleoriginal" => "Relax.vrma",
             "talking" | "speech" => "aidelle_Talking.vrma",
-            "thinking" => "Thinking.vrma",
+            "thinking" | "tilt" => "Thinking.vrma",
             "aidelle_thinking" => "aidelle_Thinking.vrma",
             "wave" | "waving" => "aidelle_Waving.vrma",
             "goodbye" => "Goodbye.vrma",
