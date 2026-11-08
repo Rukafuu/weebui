@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://crates.io/crates/gpui-vrm"><img src="https://img.shields.io/crates/v/gpui-vrm.svg" alt="Crates.io" /></a>
   <a href="https://docs.rs/gpui-vrm"><img src="https://docs.rs/gpui-vrm/badge.svg" alt="Documentation" /></a>
-  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" alt="License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
 </p>
 
 ---
@@ -171,9 +171,4 @@ div()
 
 ## 📄 License
 
-Licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
