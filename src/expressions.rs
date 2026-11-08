@@ -242,6 +242,24 @@ impl ExpressionDriver {
         self.speaking_volume = volume.clamp(0.0, 1.0);
     }
 
+    /// Fala em streaming: a duração só é conhecida no fim, então a boca segue
+    /// o volume enviado a cada chunk de PCM em vez do cronograma de visemas.
+    /// Zera o cronograma anterior para o ramo manual de `update` valer desde o
+    /// primeiro chunk, mesmo que a fala anterior ainda estivesse no ar.
+    pub fn begin_speech_stream(&mut self) {
+        self.viseme_schedule.clear();
+        self.audio_envelope_60hz.clear();
+        self.speech_elapsed = 0.0;
+        self.speech_duration = 0.0;
+        self.speaking_manual = true;
+        self.speaking_volume = 0.0;
+    }
+
+    pub fn end_speech_stream(&mut self) {
+        self.speaking_manual = false;
+        self.speaking_volume = 0.0;
+    }
+
     pub fn is_speaking(&self) -> bool {
         self.speaking_manual || self.speech_elapsed < self.speech_duration
     }

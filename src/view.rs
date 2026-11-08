@@ -48,6 +48,8 @@ enum VrmCommand {
         speaking: bool,
         volume: f32,
     },
+    BeginSpeechStream,
+    EndSpeechStream,
     LookAtNormalized {
         x: f32,
         y: f32,
@@ -161,6 +163,21 @@ impl VrmController {
             text: text.into(),
             wav_bytes,
         });
+    }
+
+    /// Inicia a fala em streaming: o clipe `talking` começa no primeiro chunk
+    /// de áudio e a boca segue `set_speaking` até `end_speech_stream`.
+    pub fn begin_speech_stream(&self) {
+        let mut lock = self.shared.lock();
+        lock.is_speaking = true;
+        lock.commands.push(VrmCommand::BeginSpeechStream);
+    }
+
+    /// Fecha a fala em streaming e devolve o avatar ao idle.
+    pub fn end_speech_stream(&self) {
+        let mut lock = self.shared.lock();
+        lock.is_speaking = false;
+        lock.commands.push(VrmCommand::EndSpeechStream);
     }
 
     /// Controla diretamente a abertura labial por volume (`0.0..=1.0`).
@@ -435,6 +452,16 @@ impl VrmView {
                 }
                 VrmCommand::SetSpeakingVolume { speaking, volume } => {
                     self.expressions.set_speaking_volume(speaking, volume);
+                }
+                VrmCommand::BeginSpeechStream => {
+                    self.expressions.begin_speech_stream();
+                    self.play_vrma_internal("talking", true, 0.35);
+                    self.was_speaking = true;
+                }
+                VrmCommand::EndSpeechStream => {
+                    self.expressions.end_speech_stream();
+                    self.was_speaking = false;
+                    self.play_vrma_internal("idle", true, 0.5);
                 }
                 VrmCommand::LookAtNormalized { x, y } => {
                     self.skeleton.look_target = Vec2::new(x, y);
