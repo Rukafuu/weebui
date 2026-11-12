@@ -114,6 +114,8 @@ pub struct VrmRenderer {
     camera: CameraState,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    portrait_camera_buffer: wgpu::Buffer,
+    portrait_camera_bind_group: wgpu::BindGroup,
 
     pipeline_opaque_back: wgpu::RenderPipeline,
     pipeline_opaque_none: wgpu::RenderPipeline,
@@ -126,6 +128,7 @@ pub struct VrmRenderer {
     opaque_draw_order: Vec<(usize, usize)>, // (gpu_mesh_idx, prim_idx) Opaque e Mask
     blend_primitives: Vec<(usize, usize)>,  // (gpu_mesh_idx, prim_idx) Blend
     targets: RenderTargets,
+    portrait_targets: Option<RenderTargets>,
 }
 
 impl VrmRenderer {
@@ -262,6 +265,20 @@ impl VrmRenderer {
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let portrait_camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("portrait_camera_uniform_buf"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let portrait_camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portrait_camera_bg"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: portrait_camera_buffer.as_entire_binding(),
             }],
         });
 
@@ -502,6 +519,8 @@ impl VrmRenderer {
             camera,
             camera_buffer,
             camera_bind_group,
+            portrait_camera_buffer,
+            portrait_camera_bind_group,
             pipeline_opaque_back,
             pipeline_opaque_none,
             pipeline_outline_front,
@@ -512,6 +531,7 @@ impl VrmRenderer {
             opaque_draw_order,
             blend_primitives,
             targets,
+            portrait_targets: None,
         })
     }
 
@@ -579,32 +599,8 @@ impl VrmRenderer {
         model: &VrmModelData,
         skeleton: &SkeletonRuntime,
     ) -> Result<Arc<RenderImage>> {
-        let width = self.targets.width;
-        let height = self.targets.height;
-        let aspect = (width as f32) / (height.max(1) as f32);
-
-        // 1. Atualiza Camera Uniform (iluminação fiel ao Usami.jsx: Hemisphere + Directional)
-        let proj = Mat4::perspective_rh(
-            self.camera.fov_y_deg.to_radians(),
-            aspect,
-            self.camera.near,
-            self.camera.far,
-        );
-        let view = Mat4::look_at_rh(self.camera.position, self.camera.target, Vec3::Y);
-        let view_proj = proj * view;
-
-        let cam_uni = CameraUniform {
-            view_proj: view_proj.to_cols_array_2d(),
-            camera_pos: self.camera.position.extend(1.0).to_array(),
-            light_dir: Vec3::new(2.0, 4.0, 4.0).normalize().extend(0.0).to_array(),
-            light_color: [1.0, 0.922, 0.847, 1.0], // 0xffebd8
-            sky_color: [1.0, 1.0, 1.0, 0.55],
-            ground_color: [0.463, 0.392, 0.522, 0.35], // 0x766485
-        };
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uni));
-
-        // 2. Atualiza matrizes de Skinning para cada malha
+        // Atualiza matrizes de Skinning para cada malha uma única vez por frame;
+        // o retrato estilo LEGO reaproveita a mesma pose e os mesmos morphs na GPU.
         for gpu_mesh in &mut self.gpu_meshes {
             skeleton.compute_skin_matrices(
                 model,
@@ -624,7 +620,80 @@ impl VrmRenderer {
             );
         }
 
-        // 3. Codifica RenderPass MSAA 4x + Resolve para textura single-sample
+        self.render_targets_pass(
+            model,
+            &self.camera,
+            &self.camera_buffer,
+            &self.camera_bind_group,
+            &self.targets,
+        )
+    }
+
+    /// Renderiza uma captura fechada no rosto (estilo retrato animado de HUD LEGO)
+    /// reaproveitando a pose esquelética e expressões já enviadas para a GPU.
+    pub fn render_portrait(
+        &mut self,
+        model: &VrmModelData,
+        width: u32,
+        height: u32,
+        camera: &CameraState,
+    ) -> Result<Arc<RenderImage>> {
+        let width = width.clamp(64, 512);
+        let height = height.clamp(64, 512);
+        let needs_alloc = match &self.portrait_targets {
+            Some(targets) => targets.width != width || targets.height != height,
+            None => true,
+        };
+        if needs_alloc {
+            self.portrait_targets = Some(create_render_targets(&self.device, width, height));
+        }
+        let targets = self
+            .portrait_targets
+            .as_ref()
+            .expect("portrait_targets alocado");
+        self.render_targets_pass(
+            model,
+            camera,
+            &self.portrait_camera_buffer,
+            &self.portrait_camera_bind_group,
+            targets,
+        )
+    }
+
+    fn render_targets_pass(
+        &self,
+        model: &VrmModelData,
+        camera: &CameraState,
+        camera_buffer: &wgpu::Buffer,
+        camera_bind_group: &wgpu::BindGroup,
+        targets: &RenderTargets,
+    ) -> Result<Arc<RenderImage>> {
+        let width = targets.width;
+        let height = targets.height;
+        let aspect = (width as f32) / (height.max(1) as f32);
+
+        // 1. Atualiza Camera Uniform (iluminação fiel ao Usami.jsx: Hemisphere + Directional)
+        let proj = Mat4::perspective_rh(
+            camera.fov_y_deg.to_radians(),
+            aspect,
+            camera.near,
+            camera.far,
+        );
+        let view = Mat4::look_at_rh(camera.position, camera.target, Vec3::Y);
+        let view_proj = proj * view;
+
+        let cam_uni = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            camera_pos: camera.position.extend(1.0).to_array(),
+            light_dir: Vec3::new(2.0, 4.0, 4.0).normalize().extend(0.0).to_array(),
+            light_color: [1.0, 0.922, 0.847, 1.0], // 0xffebd8
+            sky_color: [1.0, 1.0, 1.0, 0.55],
+            ground_color: [0.463, 0.392, 0.522, 0.35], // 0x766485
+        };
+        self.queue
+            .write_buffer(camera_buffer, 0, bytemuck::bytes_of(&cam_uni));
+
+        // 2. Codifica RenderPass MSAA 4x + Resolve para textura single-sample
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -635,15 +704,15 @@ impl VrmRenderer {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("vrm_render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.targets.msaa_view,
-                    resolve_target: Some(&self.targets.resolve_view),
+                    view: &targets.msaa_view,
+                    resolve_target: Some(&targets.resolve_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.targets.depth_view,
+                    view: &targets.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -654,7 +723,7 @@ impl VrmRenderer {
                 occlusion_query_set: None,
             });
 
-            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            rpass.set_bind_group(0, camera_bind_group, &[]);
 
             let draw_primitive = |rpass: &mut wgpu::RenderPass, m_idx: usize, p_idx: usize| {
                 let gpu_mesh = &self.gpu_meshes[m_idx];
@@ -695,7 +764,7 @@ impl VrmRenderer {
             }
 
             // 2. Passada de primitivas Blend ordenadas dinamicamente back-to-front
-            let cam_pos = self.camera.position;
+            let cam_pos = camera.position;
             let mut sorted_blends = self.blend_primitives.clone();
             sorted_blends.retain(|&(m_idx, _)| model.meshes[m_idx].visible);
             sorted_blends.sort_by(|&(m_a, p_a), &(m_b, p_b)| {
@@ -716,19 +785,19 @@ impl VrmRenderer {
             }
         }
 
-        // 4. Copia a textura resolvida (BGRA8) para o staging buffer
+        // 3. Copia a textura resolvida (BGRA8) para o staging buffer
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.targets.resolve_texture,
+                texture: &targets.resolve_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &self.targets.staging_buffer,
+                buffer: &targets.staging_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.targets.padded_bytes_per_row),
+                    bytes_per_row: Some(targets.padded_bytes_per_row),
                     rows_per_image: Some(height),
                 },
             },
@@ -741,13 +810,13 @@ impl VrmRenderer {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // 5. Mapeia e extrai os bytes BGRA8 diretamente para `gpui::RenderImage`
-        let slice = self.targets.staging_buffer.slice(..);
+        // 4. Mapeia e extrai os bytes BGRA8 diretamente para `gpui::RenderImage`
+        let slice = targets.staging_buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.device.poll(wgpu::MaintainBase::Wait);
 
         let unpadded_row = (width * 4) as usize;
-        let padded_row = self.targets.padded_bytes_per_row as usize;
+        let padded_row = targets.padded_bytes_per_row as usize;
         let total_bytes = unpadded_row * (height as usize);
         let mut raw_bgra = vec![0u8; total_bytes];
 
@@ -764,7 +833,7 @@ impl VrmRenderer {
                 }
             }
         }
-        self.targets.staging_buffer.unmap();
+        targets.staging_buffer.unmap();
 
         let img = RgbaImage::from_raw(width, height, raw_bgra)
             .context("Dimensões inválidas ao construir frame BGRA")?;

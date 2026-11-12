@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use glam::{Vec2, Vec3};
@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use crate::expressions::{EmotionConfig, ExpressionDriver};
 use crate::loader::{VrmModelData, VrmaClip};
 use crate::physics::SpringBoneSimulator;
-use crate::renderer::VrmRenderer;
+use crate::renderer::{CameraState, VrmRenderer};
 use crate::skeleton::SkeletonRuntime;
 
 /// Comandos enfileirados pelo `VrmController` para execução thread-safe no loop do `VrmView`.
@@ -75,6 +75,8 @@ struct ControllerSharedState {
     active_emotion: String,
     active_vrma: String,
     is_speaking: bool,
+    portrait_enabled: bool,
+    portrait_image: Option<Arc<RenderImage>>,
 }
 
 /// Controlador reativo e thread-safe (`Clone + Send + Sync`) para comandar o avatar 3D VRM a partir
@@ -92,6 +94,8 @@ impl VrmController {
                 active_emotion: "neutral".into(),
                 active_vrma: "idle".into(),
                 is_speaking: false,
+                portrait_enabled: false,
+                portrait_image: None,
             })),
         }
     }
@@ -244,6 +248,19 @@ impl VrmController {
     pub fn is_speaking(&self) -> bool {
         self.shared.lock().is_speaking
     }
+
+    pub fn set_portrait_enabled(&self, enabled: bool) {
+        let mut lock = self.shared.lock();
+        lock.portrait_enabled = enabled;
+        if !enabled {
+            lock.portrait_image = None;
+        }
+    }
+
+    /// Último frame renderizado da câmera fechada no rosto (estilo retrato HUD LEGO).
+    pub fn portrait_image(&self) -> Option<Arc<RenderImage>> {
+        self.shared.lock().portrait_image.clone()
+    }
 }
 
 impl Default for VrmController {
@@ -263,6 +280,7 @@ pub struct VrmView {
     vrma_dir: Option<PathBuf>,
     vrma_cache: HashMap<String, Arc<VrmaClip>>,
     last_frame_instant: Instant,
+    last_portrait_instant: Instant,
     current_image: Option<Arc<RenderImage>>,
     prev_painted_image: Arc<Mutex<Option<Arc<RenderImage>>>>,
     last_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
@@ -298,6 +316,7 @@ impl VrmView {
             vrma_dir,
             vrma_cache: HashMap::new(),
             last_frame_instant: Instant::now(),
+            last_portrait_instant: Instant::now() - Duration::from_secs(1),
             current_image: None,
             prev_painted_image: Arc::new(Mutex::new(None)),
             last_bounds: Arc::new(Mutex::new(None)),
@@ -503,6 +522,23 @@ impl VrmView {
         }
     }
 
+    fn head_portrait_camera(&self) -> CameraState {
+        let head_pos = self
+            .model
+            .humanoid_bones
+            .get("head")
+            .and_then(|&idx| self.skeleton.world_positions.get(idx).copied())
+            .unwrap_or(Vec3::new(0.0, 1.48, 0.0));
+        let target = head_pos + Vec3::new(0.0, 0.06, 0.0);
+        CameraState {
+            fov_y_deg: 27.0,
+            position: target + Vec3::new(0.04, 0.02, 0.72),
+            target,
+            near: 0.05,
+            far: 20.0,
+        }
+    }
+
     fn step_and_render(&mut self) {
         let now = Instant::now();
         let dt = now
@@ -549,6 +585,21 @@ impl VrmView {
         // 5. Renderiza o frame 3D WGPU para `gpui::RenderImage`
         if let Ok(frame_img) = self.renderer.render_frame(&self.model, &self.skeleton) {
             self.current_image = Some(frame_img);
+        }
+
+        // 6. Captura fechada do rosto (~30 FPS) para o retrato animado estilo LEGO
+        let (want_portrait, has_portrait) = {
+            let lock = self.controller.shared.lock();
+            (lock.portrait_enabled, lock.portrait_image.is_some())
+        };
+        if want_portrait
+            && (!has_portrait || self.last_portrait_instant.elapsed() >= Duration::from_millis(33))
+        {
+            let cam = self.head_portrait_camera();
+            if let Ok(portrait_img) = self.renderer.render_portrait(&self.model, 160, 160, &cam) {
+                self.controller.shared.lock().portrait_image = Some(portrait_img);
+                self.last_portrait_instant = Instant::now();
+            }
         }
     }
 }
