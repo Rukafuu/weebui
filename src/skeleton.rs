@@ -33,6 +33,8 @@ pub struct SkeletonRuntime {
     crossfade_duration: f32,
     pub strip_fingers: bool,
     pub arm_clearance_deg: f32,
+    /// Compensação automática A-Pose -> T-Pose para `leftUpperArm` e `rightUpperArm`.
+    upper_arm_tpose_offsets: HashMap<usize, Quat>,
 
     // Tempo acumulado para respiração procedural, sacadas oculares e sway
     pub time_sec: f32,
@@ -82,6 +84,7 @@ impl SkeletonRuntime {
             crossfade_duration: 0.45,
             strip_fingers: true,
             arm_clearance_deg: 26.0,
+            upper_arm_tpose_offsets: compute_tpose_arm_compensation(model),
             time_sec: 0.0,
             look_target: Vec2::ZERO,
             look_current: Vec2::ZERO,
@@ -208,10 +211,16 @@ impl SkeletonRuntime {
             };
 
             let node = &model.nodes[node_idx];
+            let tpose_comp = self
+                .upper_arm_tpose_offsets
+                .get(&node_idx)
+                .copied()
+                .unwrap_or(Quat::IDENTITY);
             let retargeted = node.rest_rotation
                 * node.rest_world_rotation.inverse()
                 * vrm_q
-                * node.rest_world_rotation;
+                * node.rest_world_rotation
+                * tpose_comp;
             self.local_rotations[node_idx] = retargeted.normalize();
         }
 
@@ -446,4 +455,101 @@ fn sample_vec3_track(times: &[f32], values: &[Vec3], time: f32) -> Vec3 {
         0.0
     };
     values[idx].lerp(values[idx + 1], alpha)
+}
+
+/// Detecta modelos em A-Pose comparando o vetor `UpperArm -> LowerArm` com o eixo
+/// horizontal de T-Pose e calcula o delta local necessário para alinhar o retargeting VRMA.
+fn compute_tpose_arm_compensation(model: &VrmModelData) -> HashMap<usize, Quat> {
+    let mut offsets = HashMap::new();
+    let pairs = [
+        ("leftUpperArm", "leftLowerArm"),
+        ("rightUpperArm", "rightLowerArm"),
+    ];
+    for (upper_name, lower_name) in pairs {
+        let (Some(&upper_idx), Some(&lower_idx)) = (
+            model.humanoid_bones.get(upper_name),
+            model.humanoid_bones.get(lower_name),
+        ) else {
+            continue;
+        };
+        let (Some(upper), Some(lower)) = (model.nodes.get(upper_idx), model.nodes.get(lower_idx))
+        else {
+            continue;
+        };
+        let arm_vec = lower.rest_world_position - upper.rest_world_position;
+        if arm_vec.length_squared() < 1e-6 || arm_vec.x.abs() < 1e-4 {
+            continue;
+        }
+        let arm_dir = arm_vec.normalize();
+        let target_dir = Vec3::new(if arm_vec.x >= 0.0 { 1.0 } else { -1.0 }, 0.0, 0.0);
+        let angle = arm_dir.angle_between(target_dir);
+        // Entre 5° e 80° caracteriza A-Pose (T-Pose fica < 5°).
+        if angle > 5.0_f32.to_radians() && angle < 80.0_f32.to_radians() {
+            let world_delta = Quat::from_rotation_arc(arm_dir, target_dir);
+            let local_delta =
+                upper.rest_world_rotation.inverse() * world_delta * upper.rest_world_rotation;
+            offsets.insert(upper_idx, local_delta.normalize());
+        }
+    }
+    offsets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loader::SceneNode;
+
+    #[test]
+    fn apose_arms_are_compensated_to_tpose() {
+        let mut humanoid_bones = HashMap::new();
+        humanoid_bones.insert("leftUpperArm".to_string(), 0);
+        humanoid_bones.insert("leftLowerArm".to_string(), 1);
+        let nodes = vec![
+            SceneNode {
+                index: 0,
+                name: "LeftUpperArm".into(),
+                parent: None,
+                children: vec![1],
+                rest_translation: Vec3::new(0.2, 1.4, 0.0),
+                rest_rotation: Quat::IDENTITY,
+                rest_scale: Vec3::ONE,
+                rest_world_matrix: Mat4::IDENTITY,
+                rest_world_rotation: Quat::IDENTITY,
+                rest_world_position: Vec3::new(0.2, 1.4, 0.0),
+            },
+            SceneNode {
+                index: 1,
+                name: "LeftLowerArm".into(),
+                parent: Some(0),
+                children: vec![],
+                rest_translation: Vec3::new(0.2, -0.2, 0.0),
+                rest_rotation: Quat::IDENTITY,
+                rest_scale: Vec3::ONE,
+                rest_world_matrix: Mat4::IDENTITY,
+                rest_world_rotation: Quat::IDENTITY,
+                rest_world_position: Vec3::new(0.4, 1.2, 0.0), // 45° A-Pose para baixo
+            },
+        ];
+        let model = VrmModelData {
+            title: "TestAvatar".into(),
+            is_vrm0: false,
+            nodes,
+            root_nodes: vec![0],
+            topological_order: vec![0, 1],
+            meshes: vec![],
+            materials: vec![],
+            textures: vec![],
+            skins: vec![],
+            humanoid_bones,
+            blend_shape_groups: vec![],
+            spring_colliders: vec![],
+            spring_bone_groups: vec![],
+            auto_scale: 1.0,
+            auto_offset: Vec3::ZERO,
+        };
+        let offsets = compute_tpose_arm_compensation(&model);
+        let q = offsets.get(&0).copied().expect("deve detectar A-Pose");
+        let rotated = q * Vec3::new(1.0, -1.0, 0.0).normalize();
+        assert!((rotated - Vec3::X).length() < 1e-4);
+    }
 }

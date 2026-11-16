@@ -863,4 +863,27 @@ mod tests {
         assert!(driver.manual_weights.is_empty());
         assert!(driver.manual_ttl.is_empty());
     }
+
+    #[test]
+    fn eyes_closed_guard_blocks_auto_blink() {
+        let mut model = empty_model();
+        model.blend_shape_groups.push(crate::loader::BlendShapeGroup {
+            name: "blink".into(),
+            preset_name: "blink".into(),
+            is_binary: false,
+            binds: vec![],
+        });
+        let mut driver = ExpressionDriver::new(&model);
+        driver.blink_timer = 0.01;
+        driver.set_emotion("blink", 10.0);
+        assert!(driver.emotion_eyes_closed);
+
+        advance(&mut driver, 0.1);
+        assert!(!driver.is_blinking);
+
+        driver.set_emotion("happy", 10.0);
+        assert!(!driver.emotion_eyes_closed);
+        advance(&mut driver, 0.1);
+        assert!(driver.is_blinking);
+    }
 }

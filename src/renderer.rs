@@ -107,7 +107,14 @@ impl Default for CameraState {
     }
 }
 
-/// Motor de renderização 3D WGPU Offscreen com suporte a MToon, Outline, MSAA 4x e BlendShapes.
+struct AvatarGpuSlot {
+    gpu_meshes: Vec<GpuMesh>,
+    gpu_materials: Vec<GpuMaterialBind>,
+    opaque_draw_order: Vec<(usize, usize)>, // (gpu_mesh_idx, prim_idx) Opaque e Mask
+    blend_primitives: Vec<(usize, usize)>,  // (gpu_mesh_idx, prim_idx) Blend
+}
+
+/// Motor de renderização 3D WGPU Offscreen com suporte a MToon, Outline, MSAA 4x, BlendShapes e Multi-Avatar.
 pub struct VrmRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -123,10 +130,11 @@ pub struct VrmRenderer {
     pipeline_blend_back: wgpu::RenderPipeline,
     pipeline_blend_none: wgpu::RenderPipeline,
 
-    gpu_meshes: Vec<GpuMesh>,
-    gpu_materials: Vec<GpuMaterialBind>,
-    opaque_draw_order: Vec<(usize, usize)>, // (gpu_mesh_idx, prim_idx) Opaque e Mask
-    blend_primitives: Vec<(usize, usize)>,  // (gpu_mesh_idx, prim_idx) Blend
+    sampler: wgpu::Sampler,
+    skin_bgl: wgpu::BindGroupLayout,
+    material_bgl: wgpu::BindGroupLayout,
+    primary: AvatarGpuSlot,
+    extra_avatars: Vec<AvatarGpuSlot>,
     targets: RenderTargets,
     portrait_targets: Option<RenderTargets>,
 }
@@ -295,221 +303,14 @@ impl VrmRenderer {
             ..Default::default()
         });
 
-        let white_tex_view = create_rgba_texture_view(&device, &queue, 1, 1, &[255, 255, 255, 255]);
-        let mut tex_views = Vec::with_capacity(model.textures.len());
-        for tex in &model.textures {
-            let view = create_rgba_texture_view(&device, &queue, tex.width, tex.height, &tex.rgba);
-            tex_views.push(view);
-        }
-
-        // 5. Bind Groups de Materiais (superfície + outline opcional)
-        let mut gpu_materials = Vec::with_capacity(model.materials.len());
-        for mat in &model.materials {
-            let base_view = mat
-                .base_texture
-                .and_then(|idx| tex_views.get(idx))
-                .unwrap_or(&white_tex_view);
-            let shade_view = mat
-                .shade_texture
-                .or(mat.base_texture)
-                .and_then(|idx| tex_views.get(idx))
-                .unwrap_or(base_view);
-
-            let surface_uni = build_material_uniform(mat, false);
-            let surface_buf = create_init_buffer(
-                &device,
-                bytemuck::bytes_of(&surface_uni),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            let surface_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&mat.name),
-                layout: &material_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: surface_buf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(base_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(shade_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            });
-
-            let outline_bind_group = if mat.has_outline && mat.alpha_mode != AlphaMode::Blend {
-                let outline_uni = build_material_uniform(mat, true);
-                let outline_buf = create_init_buffer(
-                    &device,
-                    bytemuck::bytes_of(&outline_uni),
-                    wgpu::BufferUsages::UNIFORM,
-                );
-                Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("outline_bg"),
-                    layout: &material_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: outline_buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(base_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(shade_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::Sampler(&sampler),
-                        },
-                    ],
-                }))
-            } else {
-                None
-            };
-
-            gpu_materials.push(GpuMaterialBind {
-                surface_bind_group,
-                outline_bind_group,
-            });
-        }
-
-        // 6. Malhas e Primitivas na GPU
-        let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
-
-        let root_rot = if model.is_vrm0 {
-            Quat::from_rotation_y(std::f32::consts::PI)
-        } else {
-            Quat::IDENTITY
-        };
-        let rotated_offset = root_rot * model.auto_offset;
-        let root_mat = Mat4::from_scale_rotation_translation(
-            Vec3::splat(model.auto_scale),
-            root_rot,
-            rotated_offset,
+        let primary = upload_avatar_slot(
+            &device,
+            &queue,
+            &sampler,
+            &skin_bgl,
+            &material_bgl,
+            model,
         );
-
-        for (m_idx, mesh) in model.meshes.iter().enumerate() {
-            let vcount = mesh.base_positions.len();
-            let mut cpu_vertices = Vec::with_capacity(vcount);
-            for i in 0..vcount {
-                let j = mesh.joints[i];
-                cpu_vertices.push(GpuVertex {
-                    position: mesh.base_positions[i].to_array(),
-                    normal: mesh.base_normals[i].to_array(),
-                    uv: mesh.uvs[i].to_array(),
-                    joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32],
-                    weights: mesh.weights[i],
-                });
-            }
-
-            let vertex_buffer = create_init_buffer(
-                &device,
-                bytemuck::cast_slice(&cpu_vertices),
-                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            );
-
-            let skin_matrices_scratch = vec![Mat4::IDENTITY.to_cols_array(); MAX_JOINTS];
-            let skin_buffer = create_init_buffer(
-                &device,
-                bytemuck::cast_slice(&skin_matrices_scratch),
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            );
-            let skin_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("skin_bg"),
-                layout: &skin_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: skin_buffer.as_entire_binding(),
-                }],
-            });
-
-            let mut primitives = Vec::with_capacity(mesh.primitives.len());
-            for (_p_idx, prim) in mesh.primitives.iter().enumerate() {
-                let index_buffer = create_init_buffer(
-                    &device,
-                    bytemuck::cast_slice(&prim.indices),
-                    wgpu::BufferUsages::INDEX,
-                );
-                let mat_idx = prim.material_index.min(model.materials.len() - 1);
-                let mat = &model.materials[mat_idx];
-
-                let mut min = Vec3::splat(f32::INFINITY);
-                let mut max = Vec3::splat(f32::NEG_INFINITY);
-                for &idx in &prim.indices {
-                    if let Some(&pos) = mesh.base_positions.get(idx as usize) {
-                        min = min.min(pos);
-                        max = max.max(pos);
-                    }
-                }
-                let local_center = if min.x.is_finite() && max.x.is_finite() {
-                    (min + max) * 0.5
-                } else {
-                    Vec3::ZERO
-                };
-                let world_center = if mesh.skin_index.is_some() {
-                    root_mat.transform_point3(local_center)
-                } else {
-                    let node_world = model.nodes[mesh.node_index].rest_world_matrix;
-                    (root_mat * node_world).transform_point3(local_center)
-                };
-
-                primitives.push(GpuPrimitive {
-                    index_buffer,
-                    index_count: prim.indices.len() as u32,
-                    material_index: mat_idx,
-                    render_queue: mat.render_queue,
-                    alpha_mode: mat.alpha_mode,
-                    cull_mode: mat.cull_mode,
-                    has_outline: gpu_materials[mat_idx].outline_bind_group.is_some(),
-                    world_center,
-                });
-            }
-
-            gpu_meshes.push(GpuMesh {
-                mesh_index_in_model: m_idx,
-                skin_index: mesh.skin_index,
-                vertex_buffer,
-                cpu_vertices,
-                skin_bind_group,
-                skin_buffer,
-                skin_matrices_scratch,
-                primitives,
-            });
-        }
-
-        // Separa primitivas Opaque / Mask de Blend
-        let mut opaque_draw_order = Vec::new();
-        let mut blend_primitives = Vec::new();
-        for (m_idx, mesh) in gpu_meshes.iter().enumerate() {
-            for (p_idx, prim) in mesh.primitives.iter().enumerate() {
-                if prim.alpha_mode == AlphaMode::Blend {
-                    blend_primitives.push((m_idx, p_idx));
-                } else {
-                    opaque_draw_order.push((m_idx, p_idx));
-                }
-            }
-        }
-
-        // Ordena primitivas opacas: Opaque -> Mask, respeitando render_queue do MToon
-        opaque_draw_order.sort_by_key(|&(m_idx, p_idx)| {
-            let p = &gpu_meshes[m_idx].primitives[p_idx];
-            let cat = match p.alpha_mode {
-                AlphaMode::Opaque => 0,
-                AlphaMode::Mask => 1,
-                AlphaMode::Blend => 2,
-            };
-            (cat, p.render_queue)
-        });
 
         let targets = create_render_targets(&device, width, height);
 
@@ -526,13 +327,43 @@ impl VrmRenderer {
             pipeline_outline_front,
             pipeline_blend_back,
             pipeline_blend_none,
-            gpu_meshes,
-            gpu_materials,
-            opaque_draw_order,
-            blend_primitives,
+            sampler,
+            skin_bgl,
+            material_bgl,
+            primary,
+            extra_avatars: Vec::new(),
             targets,
             portrait_targets: None,
         })
+    }
+
+    /// Registra um avatar secundário no mesmo estágio WGPU (retorna o índice do slot).
+    pub fn add_secondary_avatar(&mut self, model: &VrmModelData) -> usize {
+        let slot = upload_avatar_slot(
+            &self.device,
+            &self.queue,
+            &self.sampler,
+            &self.skin_bgl,
+            &self.material_bgl,
+            model,
+        );
+        self.extra_avatars.push(slot);
+        self.extra_avatars.len() - 1
+    }
+
+    pub fn clear_secondary_avatars(&mut self) {
+        self.extra_avatars.clear();
+    }
+
+    pub fn update_secondary_morph_targets(
+        &mut self,
+        slot_idx: usize,
+        model: &VrmModelData,
+        mesh_weights: &[Vec<f32>],
+    ) {
+        if let Some(slot) = self.extra_avatars.get_mut(slot_idx) {
+            update_slot_morphs(&self.queue, slot, model, mesh_weights);
+        }
     }
 
     pub fn camera_mut(&mut self) -> &mut CameraState {
@@ -549,48 +380,7 @@ impl VrmRenderer {
 
     /// Atualiza os vértices deformados por BlendShapes/MorphTargets na GPU apenas para malhas com alvos ativos.
     pub fn update_morph_targets(&mut self, model: &VrmModelData, mesh_weights: &[Vec<f32>]) {
-        for gpu_mesh in &mut self.gpu_meshes {
-            let m_idx = gpu_mesh.mesh_index_in_model;
-            let mesh = &model.meshes[m_idx];
-            if mesh.morph_targets.is_empty() {
-                continue;
-            }
-            let Some(weights) = mesh_weights.get(m_idx) else {
-                continue;
-            };
-
-            // Restaura posições e normais base
-            for (i, v) in gpu_mesh.cpu_vertices.iter_mut().enumerate() {
-                v.position = mesh.base_positions[i].to_array();
-                v.normal = mesh.base_normals[i].to_array();
-            }
-
-            // Acumula apenas os morph targets com peso não-zero usando a lista esparsa
-            for (t_idx, &w) in weights.iter().enumerate() {
-                if w <= 0.001 {
-                    continue;
-                }
-                let mt = &mesh.morph_targets[t_idx];
-                for &(vi, dp) in &mt.position_deltas {
-                    let pos = &mut gpu_mesh.cpu_vertices[vi as usize].position;
-                    pos[0] += dp.x * w;
-                    pos[1] += dp.y * w;
-                    pos[2] += dp.z * w;
-                }
-                for &(vi, dn) in &mt.normal_deltas {
-                    let norm = &mut gpu_mesh.cpu_vertices[vi as usize].normal;
-                    norm[0] += dn.x * w;
-                    norm[1] += dn.y * w;
-                    norm[2] += dn.z * w;
-                }
-            }
-
-            self.queue.write_buffer(
-                &gpu_mesh.vertex_buffer,
-                0,
-                bytemuck::cast_slice(&gpu_mesh.cpu_vertices),
-            );
-        }
+        update_slot_morphs(&self.queue, &mut self.primary, model, mesh_weights);
     }
 
     /// Renderiza a cena completa em BGRA8 com fundo transparente e retorna um `Arc<RenderImage>` pronto para o GPUI.
@@ -599,29 +389,40 @@ impl VrmRenderer {
         model: &VrmModelData,
         skeleton: &SkeletonRuntime,
     ) -> Result<Arc<RenderImage>> {
-        // Atualiza matrizes de Skinning para cada malha uma única vez por frame;
-        // o retrato estilo LEGO reaproveita a mesma pose e os mesmos morphs na GPU.
-        for gpu_mesh in &mut self.gpu_meshes {
-            skeleton.compute_skin_matrices(
-                model,
-                gpu_mesh.skin_index,
-                &mut gpu_mesh.skin_matrices_scratch,
-            );
-            let joint_count = gpu_mesh
-                .skin_index
-                .and_then(|s| model.skins.get(s))
-                .map(|sk| sk.joints.len().min(MAX_JOINTS))
-                .unwrap_or(1)
-                .max(1);
-            self.queue.write_buffer(
-                &gpu_mesh.skin_buffer,
-                0,
-                bytemuck::cast_slice(&gpu_mesh.skin_matrices_scratch[..joint_count]),
-            );
+        upload_skin_matrices(&self.queue, &mut self.primary, model, skeleton);
+
+        self.render_targets_pass_slots(
+            &[(model, &self.primary)],
+            &self.camera,
+            &self.camera_buffer,
+            &self.camera_bind_group,
+            &self.targets,
+        )
+    }
+
+    /// Renderiza múltiplos avatares na mesma cena WGPU compartilhando profundidade e iluminação.
+    pub fn render_frame_multi(
+        &mut self,
+        primary: (&VrmModelData, &SkeletonRuntime),
+        secondaries: &[(usize, &VrmModelData, &SkeletonRuntime)],
+    ) -> Result<Arc<RenderImage>> {
+        upload_skin_matrices(&self.queue, &mut self.primary, primary.0, primary.1);
+        for &(slot_idx, model, skeleton) in secondaries {
+            if let Some(slot) = self.extra_avatars.get_mut(slot_idx) {
+                upload_skin_matrices(&self.queue, slot, model, skeleton);
+            }
         }
 
-        self.render_targets_pass(
-            model,
+        let mut slots: Vec<(&VrmModelData, &AvatarGpuSlot)> = Vec::with_capacity(1 + secondaries.len());
+        slots.push((primary.0, &self.primary));
+        for &(slot_idx, model, _) in secondaries {
+            if let Some(slot) = self.extra_avatars.get(slot_idx) {
+                slots.push((model, slot));
+            }
+        }
+
+        self.render_targets_pass_slots(
+            &slots,
             &self.camera,
             &self.camera_buffer,
             &self.camera_bind_group,
@@ -651,8 +452,8 @@ impl VrmRenderer {
             .portrait_targets
             .as_ref()
             .expect("portrait_targets alocado");
-        self.render_targets_pass(
-            model,
+        self.render_targets_pass_slots(
+            &[(model, &self.primary)],
             camera,
             &self.portrait_camera_buffer,
             &self.portrait_camera_bind_group,
@@ -660,9 +461,9 @@ impl VrmRenderer {
         )
     }
 
-    fn render_targets_pass(
+    fn render_targets_pass_slots(
         &self,
-        model: &VrmModelData,
+        slots: &[(&VrmModelData, &AvatarGpuSlot)],
         camera: &CameraState,
         camera_buffer: &wgpu::Buffer,
         camera_bind_group: &wgpu::BindGroup,
@@ -725,10 +526,10 @@ impl VrmRenderer {
 
             rpass.set_bind_group(0, camera_bind_group, &[]);
 
-            let draw_primitive = |rpass: &mut wgpu::RenderPass, m_idx: usize, p_idx: usize| {
-                let gpu_mesh = &self.gpu_meshes[m_idx];
+            let draw_primitive = |rpass: &mut wgpu::RenderPass, slot: &AvatarGpuSlot, m_idx: usize, p_idx: usize| {
+                let gpu_mesh = &slot.gpu_meshes[m_idx];
                 let prim = &gpu_mesh.primitives[p_idx];
-                let gpu_mat = &self.gpu_materials[prim.material_index];
+                let gpu_mat = &slot.gpu_materials[prim.material_index];
 
                 rpass.set_bind_group(1, &gpu_mesh.skin_bind_group, &[]);
                 rpass.set_vertex_buffer(0, gpu_mesh.vertex_buffer.slice(..));
@@ -756,20 +557,28 @@ impl VrmRenderer {
             };
 
             // 1. Passada de primitivas Opaque e Mask (escrevem depth buffer)
-            for &(m_idx, p_idx) in &self.opaque_draw_order {
-                if !model.meshes[m_idx].visible {
-                    continue;
+            for &(model, slot) in slots {
+                for &(m_idx, p_idx) in &slot.opaque_draw_order {
+                    if !model.meshes[m_idx].visible {
+                        continue;
+                    }
+                    draw_primitive(&mut rpass, slot, m_idx, p_idx);
                 }
-                draw_primitive(&mut rpass, m_idx, p_idx);
             }
 
-            // 2. Passada de primitivas Blend ordenadas dinamicamente back-to-front
+            // 2. Passada de primitivas Blend ordenadas dinamicamente back-to-front entre todos os avatares
             let cam_pos = camera.position;
-            let mut sorted_blends = self.blend_primitives.clone();
-            sorted_blends.retain(|&(m_idx, _)| model.meshes[m_idx].visible);
-            sorted_blends.sort_by(|&(m_a, p_a), &(m_b, p_b)| {
-                let prim_a = &self.gpu_meshes[m_a].primitives[p_a];
-                let prim_b = &self.gpu_meshes[m_b].primitives[p_b];
+            let mut sorted_blends: Vec<(usize, usize, usize)> = Vec::new();
+            for (s_idx, &(model, slot)) in slots.iter().enumerate() {
+                for &(m_idx, p_idx) in &slot.blend_primitives {
+                    if model.meshes[m_idx].visible {
+                        sorted_blends.push((s_idx, m_idx, p_idx));
+                    }
+                }
+            }
+            sorted_blends.sort_by(|&(s_a, m_a, p_a), &(s_b, m_b, p_b)| {
+                let prim_a = &slots[s_a].1.gpu_meshes[m_a].primitives[p_a];
+                let prim_b = &slots[s_b].1.gpu_meshes[m_b].primitives[p_b];
                 if prim_a.render_queue != prim_b.render_queue {
                     prim_a.render_queue.cmp(&prim_b.render_queue)
                 } else {
@@ -780,8 +589,8 @@ impl VrmRenderer {
                 }
             });
 
-            for (m_idx, p_idx) in sorted_blends {
-                draw_primitive(&mut rpass, m_idx, p_idx);
+            for (s_idx, m_idx, p_idx) in sorted_blends {
+                draw_primitive(&mut rpass, slots[s_idx].1, m_idx, p_idx);
             }
         }
 
@@ -839,6 +648,307 @@ impl VrmRenderer {
             .context("Dimensões inválidas ao construir frame BGRA")?;
         let frame = Frame::new(img);
         Ok(Arc::new(RenderImage::new(smallvec![frame])))
+    }
+}
+
+fn upload_avatar_slot(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    sampler: &wgpu::Sampler,
+    skin_bgl: &wgpu::BindGroupLayout,
+    material_bgl: &wgpu::BindGroupLayout,
+    model: &VrmModelData,
+) -> AvatarGpuSlot {
+    let white_tex_view = create_rgba_texture_view(device, queue, 1, 1, &[255, 255, 255, 255]);
+    let mut tex_views = Vec::with_capacity(model.textures.len());
+    for tex in &model.textures {
+        let view = create_rgba_texture_view(device, queue, tex.width, tex.height, &tex.rgba);
+        tex_views.push(view);
+    }
+
+    let mut gpu_materials = Vec::with_capacity(model.materials.len());
+    for mat in &model.materials {
+        let base_view = mat
+            .base_texture
+            .and_then(|idx| tex_views.get(idx))
+            .unwrap_or(&white_tex_view);
+        let shade_view = mat
+            .shade_texture
+            .or(mat.base_texture)
+            .and_then(|idx| tex_views.get(idx))
+            .unwrap_or(base_view);
+
+        let surface_uni = build_material_uniform(mat, false);
+        let surface_buf = create_init_buffer(
+            device,
+            bytemuck::bytes_of(&surface_uni),
+            wgpu::BufferUsages::UNIFORM,
+        );
+        let surface_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&mat.name),
+            layout: material_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: surface_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(base_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(shade_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+
+        let outline_bind_group = if mat.has_outline && mat.alpha_mode != AlphaMode::Blend {
+            let outline_uni = build_material_uniform(mat, true);
+            let outline_buf = create_init_buffer(
+                device,
+                bytemuck::bytes_of(&outline_uni),
+                wgpu::BufferUsages::UNIFORM,
+            );
+            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("outline_bg"),
+                layout: material_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: outline_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(base_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(shade_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
+
+        gpu_materials.push(GpuMaterialBind {
+            surface_bind_group,
+            outline_bind_group,
+        });
+    }
+
+    let mut gpu_meshes = Vec::with_capacity(model.meshes.len());
+    let root_rot = if model.is_vrm0 {
+        Quat::from_rotation_y(std::f32::consts::PI)
+    } else {
+        Quat::IDENTITY
+    };
+    let rotated_offset = root_rot * model.auto_offset;
+    let root_mat = Mat4::from_scale_rotation_translation(
+        Vec3::splat(model.auto_scale),
+        root_rot,
+        rotated_offset,
+    );
+
+    for (m_idx, mesh) in model.meshes.iter().enumerate() {
+        let vcount = mesh.base_positions.len();
+        let mut cpu_vertices = Vec::with_capacity(vcount);
+        for i in 0..vcount {
+            let j = mesh.joints[i];
+            cpu_vertices.push(GpuVertex {
+                position: mesh.base_positions[i].to_array(),
+                normal: mesh.base_normals[i].to_array(),
+                uv: mesh.uvs[i].to_array(),
+                joints: [j[0] as u32, j[1] as u32, j[2] as u32, j[3] as u32],
+                weights: mesh.weights[i],
+            });
+        }
+
+        let vertex_buffer = create_init_buffer(
+            device,
+            bytemuck::cast_slice(&cpu_vertices),
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let skin_matrices_scratch = vec![Mat4::IDENTITY.to_cols_array(); MAX_JOINTS];
+        let skin_buffer = create_init_buffer(
+            device,
+            bytemuck::cast_slice(&skin_matrices_scratch),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        );
+        let skin_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("skin_bg"),
+            layout: skin_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: skin_buffer.as_entire_binding(),
+            }],
+        });
+
+        let mut primitives = Vec::with_capacity(mesh.primitives.len());
+        for prim in &mesh.primitives {
+            let index_buffer = create_init_buffer(
+                device,
+                bytemuck::cast_slice(&prim.indices),
+                wgpu::BufferUsages::INDEX,
+            );
+            let mat_idx = prim.material_index.min(model.materials.len() - 1);
+            let mat = &model.materials[mat_idx];
+
+            let mut min = Vec3::splat(f32::INFINITY);
+            let mut max = Vec3::splat(f32::NEG_INFINITY);
+            for &idx in &prim.indices {
+                if let Some(&pos) = mesh.base_positions.get(idx as usize) {
+                    min = min.min(pos);
+                    max = max.max(pos);
+                }
+            }
+            let local_center = if min.x.is_finite() && max.x.is_finite() {
+                (min + max) * 0.5
+            } else {
+                Vec3::ZERO
+            };
+            let world_center = if mesh.skin_index.is_some() {
+                root_mat.transform_point3(local_center)
+            } else {
+                let node_world = model.nodes[mesh.node_index].rest_world_matrix;
+                (root_mat * node_world).transform_point3(local_center)
+            };
+
+            primitives.push(GpuPrimitive {
+                index_buffer,
+                index_count: prim.indices.len() as u32,
+                material_index: mat_idx,
+                render_queue: mat.render_queue,
+                alpha_mode: mat.alpha_mode,
+                cull_mode: mat.cull_mode,
+                has_outline: gpu_materials[mat_idx].outline_bind_group.is_some(),
+                world_center,
+            });
+        }
+
+        gpu_meshes.push(GpuMesh {
+            mesh_index_in_model: m_idx,
+            skin_index: mesh.skin_index,
+            vertex_buffer,
+            cpu_vertices,
+            skin_bind_group,
+            skin_buffer,
+            skin_matrices_scratch,
+            primitives,
+        });
+    }
+
+    let mut opaque_draw_order = Vec::new();
+    let mut blend_primitives = Vec::new();
+    for (m_idx, mesh) in gpu_meshes.iter().enumerate() {
+        for (p_idx, prim) in mesh.primitives.iter().enumerate() {
+            if prim.alpha_mode == AlphaMode::Blend {
+                blend_primitives.push((m_idx, p_idx));
+            } else {
+                opaque_draw_order.push((m_idx, p_idx));
+            }
+        }
+    }
+
+    opaque_draw_order.sort_by_key(|&(m_idx, p_idx)| {
+        let p = &gpu_meshes[m_idx].primitives[p_idx];
+        let cat = match p.alpha_mode {
+            AlphaMode::Opaque => 0,
+            AlphaMode::Mask => 1,
+            AlphaMode::Blend => 2,
+        };
+        (cat, p.render_queue)
+    });
+
+    AvatarGpuSlot {
+        gpu_meshes,
+        gpu_materials,
+        opaque_draw_order,
+        blend_primitives,
+    }
+}
+
+fn upload_skin_matrices(
+    queue: &wgpu::Queue,
+    slot: &mut AvatarGpuSlot,
+    model: &VrmModelData,
+    skeleton: &SkeletonRuntime,
+) {
+    for gpu_mesh in &mut slot.gpu_meshes {
+        skeleton.compute_skin_matrices(
+            model,
+            gpu_mesh.skin_index,
+            &mut gpu_mesh.skin_matrices_scratch,
+        );
+        let joint_count = gpu_mesh
+            .skin_index
+            .and_then(|s| model.skins.get(s))
+            .map(|sk| sk.joints.len().min(MAX_JOINTS))
+            .unwrap_or(1)
+            .max(1);
+        queue.write_buffer(
+            &gpu_mesh.skin_buffer,
+            0,
+            bytemuck::cast_slice(&gpu_mesh.skin_matrices_scratch[..joint_count]),
+        );
+    }
+}
+
+fn update_slot_morphs(
+    queue: &wgpu::Queue,
+    slot: &mut AvatarGpuSlot,
+    model: &VrmModelData,
+    mesh_weights: &[Vec<f32>],
+) {
+    for gpu_mesh in &mut slot.gpu_meshes {
+        let m_idx = gpu_mesh.mesh_index_in_model;
+        let mesh = &model.meshes[m_idx];
+        if mesh.morph_targets.is_empty() {
+            continue;
+        }
+        let Some(weights) = mesh_weights.get(m_idx) else {
+            continue;
+        };
+
+        for (i, v) in gpu_mesh.cpu_vertices.iter_mut().enumerate() {
+            v.position = mesh.base_positions[i].to_array();
+            v.normal = mesh.base_normals[i].to_array();
+        }
+
+        for (t_idx, &w) in weights.iter().enumerate() {
+            if w <= 0.001 {
+                continue;
+            }
+            let mt = &mesh.morph_targets[t_idx];
+            for &(vi, dp) in &mt.position_deltas {
+                let pos = &mut gpu_mesh.cpu_vertices[vi as usize].position;
+                pos[0] += dp.x * w;
+                pos[1] += dp.y * w;
+                pos[2] += dp.z * w;
+            }
+            for &(vi, dn) in &mt.normal_deltas {
+                let norm = &mut gpu_mesh.cpu_vertices[vi as usize].normal;
+                norm[0] += dn.x * w;
+                norm[1] += dn.y * w;
+                norm[2] += dn.z * w;
+            }
+        }
+
+        queue.write_buffer(
+            &gpu_mesh.vertex_buffer,
+            0,
+            bytemuck::cast_slice(&gpu_mesh.cpu_vertices),
+        );
     }
 }
 

@@ -9,8 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://crates.io/crates/gpui-vrm"><img src="https://img.shields.io/crates/v/gpui-vrm.svg" alt="Crates.io" /></a>
-  <a href="https://docs.rs/gpui-vrm"><img src="https://docs.rs/gpui-vrm/badge.svg" alt="Documentation" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" /></a>
 </p>
 
@@ -24,15 +22,15 @@ It brings full **VRM 0.x / 1.0** and **glTF 2.0** support to GPUI applications w
 
 ## ✨ Features
 
-- **🚀 100% Native Rust & GPUI**: Zero Electron, zero WebViews, zero IPC overhead. Seamlessly renders inside GPUI's layout tree using sprite atlas image blitting.
+- **🚀 100% Native Rust & GPUI**: Zero Electron, zero WebViews, zero IPC overhead. The WGPU frame is handed to GPUI as a `gpui::RenderImage` and painted on a canvas inside GPUI's layout tree.
 - **🎨 MToon Cel-Shading**: WGSL shader featuring anime-style shading steps (`_ShadeShift`, `_ShadeToony`), hemispheric ambient + directional lighting, Fresnel rim lighting, and inverted-hull backface outline extrusion.
 - **⚡ High-Performance Parallel Loader**: Multi-threaded texture decompression (`image` crate via `std::thread::scope`) and zero-copy binary glTF chunk parsing.
-- **💃 VRMA Skeletal Retargeting**: Plays standard `.vrma` (`VRMC_vrm_animation`) clips with smooth crossfade blending, arm clearance adjustment, procedural breathing idle sway, and mouse cursor Look-At IK.
+- **💃 VRMA Skeletal Retargeting**: Plays standard `.vrma` (`VRMC_vrm_animation`) clips with smooth crossfade blending, arm clearance adjustment, procedural breathing idle sway, and mouse cursor Look-At IK with eye micro-saccades.
 - **🌸 Verlet SpringBone Physics**: Real-time simulation of hair, ribbons, sleeves, and skirts with spherical collision detection (`colliderGroups`).
 - **🗣️ Facial Blendshapes & Lip-Sync**:
   - Full support for VRM 0.x (`Joy`, `Angry`, `Sorrow`, `Fun`, `Blink`, `A, I, U, E, O`) and VRM 1.0 (`happy`, `sad`, `angry`, `relaxed`, `surprised`, `aa, ih, ou, ee, oh`).
-  - Automatic natural blinking with micro-sacadas.
-  - Real-time phonetic vowel scheduling + 60Hz RMS audio envelope extraction from WAV sound files.
+  - Automatic natural blinking with randomized intervals and occasional double blinks.
+  - Real-time phonetic vowel scheduling + 60Hz RMS audio envelope extraction from WAV sound files (or PCM volume driven by the host for streaming audio).
   - Dynamic runtime emotion registration via `VrmController::register_emotion`.
 - **🎮 Interactive Camera Controls**: Mouse drag orbit (yaw/pitch) and scroll-wheel zoom built into the GPUI element.
 
@@ -73,12 +71,12 @@ flowchart TD
 
 ## 📦 Installation
 
-Add `gpui-vrm` to your `Cargo.toml`:
+`gpui-vrm` is not published on crates.io yet, so it is consumed by path. That is how `usami-desktop` depends on it:
 
 ```toml
 [dependencies]
 gpui = "0.2.2"
-gpui-vrm = "0.1.0"
+gpui-vrm = { path = "../gpui-vrm" }
 ```
 
 ---
@@ -122,11 +120,14 @@ You can run the interactive viewer example immediately with any `.vrm` file:
 cargo run --example avatar_viewer -- path/to/avatar.vrm [path/to/vrma_folder]
 ```
 
+Run without arguments and the example falls back to `model.vrm`, `avatar.vrm` and the Usami model/animation folders (`../usami/public/models/shiro.vrm`, `../usami/public/animations/vrma`).
+
 ### Controls in Viewer:
 - **Left Mouse Click + Drag**: Smooth camera orbit (yaw and pitch)
 - **Mouse Scroll Wheel**: Camera zoom in / out
 - **Mouse Movement**: Avatar eyes and head follow the mouse cursor (Look-At IK)
-- **Interactive Buttons**: Test standard emotions (`Joy`, `Angry`, `Sorrow`, `Relaxed`, `Surprised`, `Blink`) and phonetic lip-sync.
+- **Emotion Buttons**: `Neutral`, `Joy (Happy)`, `Angry`, `Sorrow (Sad)`, `Relaxed`, `Surprised`, `Blink`
+- **Lip-Sync Buttons**: `Say Hello` and `Vowels A-E-I-O-U`
 
 ---
 
@@ -152,6 +153,16 @@ ctrl.look_at_normalized(0.2, -0.1);
 
 // Register custom emotion mapping at runtime
 ctrl.register_emotion("smug", EmotionConfig::new(&[("smug_face", 1.0)], false));
+
+// Streaming speech (PCM-driven lip-sync, used by the desktop client):
+// call once when audio starts, feed the level of each chunk, close at the end
+ctrl.begin_speech_stream();
+ctrl.set_speaking(true, level); // level: 0.0..=1.0
+ctrl.end_speech_stream();
+
+// Head-only portrait render for HUDs (updated at ~30 FPS while enabled)
+ctrl.set_portrait_enabled(true);
+let portrait = ctrl.portrait_image(); // Option<Arc<RenderImage>>
 ```
 
 ### `VrmView`

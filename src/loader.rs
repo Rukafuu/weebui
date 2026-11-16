@@ -790,6 +790,11 @@ impl VrmModelData {
                 });
             }
         }
+        if blend_shape_groups.is_empty() {
+            if let Some(expr_root) = vrm1_ext.and_then(|v| v.get("expressions")) {
+                parse_vrm1_expressions(expr_root, &meshes, &mut blend_shape_groups);
+            }
+        }
 
         // 9. SpringBone Secondary Animation (VRM 0.x)
         let mut spring_colliders = Vec::new();
@@ -868,6 +873,16 @@ impl VrmModelData {
                         });
                     }
                 }
+            }
+        }
+        if spring_bone_groups.is_empty() {
+            if let Some(sb1) = raw_json.get("extensions").and_then(|e| e.get("VRMC_springBone")) {
+                parse_vrm1_spring_bones(
+                    sb1,
+                    &mut spring_colliders,
+                    &mut collider_group_ranges,
+                    &mut spring_bone_groups,
+                );
             }
         }
 
@@ -1142,4 +1157,248 @@ fn extract_mesh_target_names(raw_mesh: Option<&Value>) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+fn parse_vrm1_expressions(
+    expr_root: &Value,
+    meshes: &[VrmMesh],
+    out: &mut Vec<BlendShapeGroup>,
+) {
+    let mut push_map = |obj: &serde_json::Map<String, Value>, is_preset: bool| {
+        for (expr_name, entry) in obj {
+            let is_binary = entry
+                .get("isBinary")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let mut binds = Vec::new();
+            if let Some(arr) = entry.get("morphTargetBinds").and_then(|b| b.as_array()) {
+                for b in arr {
+                    let Some(node_idx) = b.get("node").and_then(|v| v.as_u64()) else {
+                        continue;
+                    };
+                    let Some(mesh_index) = meshes.iter().position(|m| m.node_index == node_idx as usize) else {
+                        continue;
+                    };
+                    let Some(target_index) = b.get("index").and_then(|v| v.as_u64()) else {
+                        continue;
+                    };
+                    let weight = b
+                        .get("weight")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1.0) as f32;
+                    binds.push(BlendShapeBind {
+                        mesh_index,
+                        target_index: target_index as usize,
+                        weight: weight.clamp(0.0, 1.0),
+                    });
+                }
+            }
+            out.push(BlendShapeGroup {
+                name: expr_name.clone(),
+                preset_name: if is_preset {
+                    expr_name.clone()
+                } else {
+                    "custom".to_string()
+                },
+                is_binary,
+                binds,
+            });
+        }
+    };
+
+    if let Some(preset_obj) = expr_root.get("preset").and_then(|p| p.as_object()) {
+        push_map(preset_obj, true);
+    }
+    if let Some(custom_obj) = expr_root.get("custom").and_then(|c| c.as_object()) {
+        push_map(custom_obj, false);
+    }
+}
+
+fn parse_vrm1_spring_bones(
+    sb1: &Value,
+    spring_colliders: &mut Vec<SpringCollider>,
+    collider_group_ranges: &mut Vec<Vec<usize>>,
+    spring_bone_groups: &mut Vec<SpringBoneGroup>,
+) {
+    if let Some(cols) = sb1.get("colliders").and_then(|c| c.as_array()) {
+        for col in cols {
+            let node_index = col.get("node").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+            let sphere = col.get("shape").and_then(|s| s.get("sphere"));
+            let offset = sphere
+                .and_then(|sp| sp.get("offset"))
+                .and_then(|o| o.as_array())
+                .map(|a| {
+                    Vec3::new(
+                        a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        a.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    )
+                })
+                .unwrap_or(Vec3::ZERO);
+            let radius = sphere
+                .and_then(|sp| sp.get("radius"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.02) as f32;
+            spring_colliders.push(SpringCollider {
+                node_index,
+                offset,
+                radius,
+            });
+        }
+    }
+
+    if let Some(cgs) = sb1.get("colliderGroups").and_then(|c| c.as_array()) {
+        for cg in cgs {
+            let indices = cg
+                .get("colliders")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|u| u as usize))
+                        .filter(|&idx| idx < spring_colliders.len())
+                        .collect()
+                })
+                .unwrap_or_default();
+            collider_group_ranges.push(indices);
+        }
+    }
+
+    if let Some(springs) = sb1.get("springs").and_then(|s| s.as_array()) {
+        for sp in springs {
+            let comment = sp
+                .get("name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let joints = sp.get("joints").and_then(|j| j.as_array());
+            let first_joint = joints.and_then(|arr| arr.first());
+            let root_bones: Vec<usize> = first_joint
+                .and_then(|j| j.get("node"))
+                .and_then(|n| n.as_u64())
+                .map(|n| vec![n as usize])
+                .unwrap_or_default();
+            if root_bones.is_empty() {
+                continue;
+            }
+            let stiffness = first_joint
+                .and_then(|j| j.get("stiffness"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            let gravity_power = first_joint
+                .and_then(|j| j.get("gravityPower"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            let drag_force = first_joint
+                .and_then(|j| j.get("dragForce"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.4) as f32;
+            let hit_radius = first_joint
+                .and_then(|j| j.get("hitRadius"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.02) as f32;
+            let gravity_dir = first_joint
+                .and_then(|j| j.get("gravityDir"))
+                .and_then(|d| d.as_array())
+                .map(|a| {
+                    Vec3::new(
+                        a.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                        a.get(1).and_then(|v| v.as_f64()).unwrap_or(-1.0) as f32,
+                        a.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                    )
+                })
+                .unwrap_or(Vec3::new(0.0, -1.0, 0.0))
+                .normalize_or_zero();
+
+            let mut collider_indices = Vec::new();
+            if let Some(cg_refs) = sp.get("colliderGroups").and_then(|c| c.as_array()) {
+                for r in cg_refs {
+                    if let Some(cg_idx) = r.as_u64() {
+                        if let Some(list) = collider_group_ranges.get(cg_idx as usize) {
+                            collider_indices.extend_from_slice(list);
+                        }
+                    }
+                }
+            }
+
+            spring_bone_groups.push(SpringBoneGroup {
+                comment,
+                stiffness,
+                gravity_power,
+                gravity_dir,
+                drag_force,
+                hit_radius,
+                root_bones,
+                collider_indices,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_vrm1_expressions_and_spring_bones() {
+        let meshes = vec![VrmMesh {
+            mesh_index: 0,
+            name: "Face".into(),
+            node_index: 0,
+            skin_index: None,
+            visible: true,
+            base_positions: vec![],
+            base_normals: vec![],
+            uvs: vec![],
+            joints: vec![],
+            weights: vec![],
+            primitives: vec![],
+            morph_targets: vec![],
+        }];
+
+        let expr_json = serde_json::json!({
+            "preset": {
+                "happy": {
+                    "isBinary": false,
+                    "morphTargetBinds": [{ "node": 0, "index": 3, "weight": 0.85 }]
+                }
+            },
+            "custom": {
+                "tsundere_blush": {
+                    "isBinary": true,
+                    "morphTargetBinds": [{ "node": 0, "index": 7, "weight": 1.0 }]
+                }
+            }
+        });
+        let mut groups = Vec::new();
+        parse_vrm1_expressions(&expr_json, &meshes, &mut groups);
+        assert_eq!(groups.len(), 2);
+        let happy = groups.iter().find(|g| g.preset_name == "happy").unwrap();
+        assert_eq!(happy.binds[0].mesh_index, 0);
+        assert_eq!(happy.binds[0].target_index, 3);
+        assert!((happy.binds[0].weight - 0.85).abs() < 1e-5);
+        let custom = groups.iter().find(|g| g.name == "tsundere_blush").unwrap();
+        assert_eq!(custom.preset_name, "custom");
+        assert!(custom.is_binary);
+
+        let sb_json = serde_json::json!({
+            "colliders": [
+                { "node": 0, "shape": { "sphere": { "offset": [0.0, 0.1, 0.0], "radius": 0.08 } } }
+            ],
+            "colliderGroups": [{ "colliders": [0] }],
+            "springs": [{
+                "name": "hair",
+                "joints": [{ "node": 1, "stiffness": 1.4, "gravityPower": 0.2, "dragForce": 0.5, "hitRadius": 0.03 }],
+                "colliderGroups": [0]
+            }]
+        });
+        let mut cols = Vec::new();
+        let mut ranges = Vec::new();
+        let mut springs = Vec::new();
+        parse_vrm1_spring_bones(&sb_json, &mut cols, &mut ranges, &mut springs);
+        assert_eq!(cols.len(), 1);
+        assert_eq!(springs.len(), 1);
+        assert_eq!(springs[0].root_bones, vec![1]);
+        assert_eq!(springs[0].collider_indices, vec![0]);
+        assert!((springs[0].stiffness - 1.4).abs() < 1e-5);
+    }
 }
