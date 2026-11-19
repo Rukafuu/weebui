@@ -320,10 +320,13 @@ impl SkeletonRuntime {
             self.local_rotations[chest] = (self.local_rotations[chest] * q).normalize();
         }
 
-        // Orientação da cabeça/pescoço acompanhando o mouse (com compensação de sinal VRM 0.x)
-        let sign = if model.is_vrm0 { -1.0 } else { 1.0 };
-        let yaw = self.look_current.x * 0.28 * sign;
-        let pitch = -self.look_current.y * 0.18 * sign;
+        // Orientação da cabeça/pescoço acompanhando o mouse.
+        // Em VRM 0.x o modelo é rotacionado 180° em Y: yaw em torno de Y mantém o
+        // sentido, mas o pitch em torno de X inverte (o eixo local X aponta para o
+        // lado oposto no mundo).
+        let pitch_sign = if model.is_vrm0 { -1.0 } else { 1.0 };
+        let yaw = self.look_current.x * 0.28;
+        let pitch = -self.look_current.y * 0.18 * pitch_sign;
         let head_tilt = (t * 0.65).sin() * 0.022;
 
         if let Some(&neck) = model.humanoid_bones.get("neck") {
@@ -336,8 +339,8 @@ impl SkeletonRuntime {
         }
 
         // Olhos (leftEye / rightEye) com Look-At + micro-sacadas
-        let eye_yaw = (self.look_current.x * 0.12 + self.saccade_offset.x) * sign;
-        let eye_pitch = (-self.look_current.y * 0.08 + self.saccade_offset.y) * sign;
+        let eye_yaw = self.look_current.x * 0.12 + self.saccade_offset.x;
+        let eye_pitch = (-self.look_current.y * 0.08 + self.saccade_offset.y) * pitch_sign;
         let eye_q = Quat::from_euler(EulerRot::YXZ, eye_yaw, eye_pitch, 0.0);
         for eye_name in ["leftEye", "rightEye"] {
             if let Some(&eye_idx) = model.humanoid_bones.get(eye_name) {

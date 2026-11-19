@@ -194,7 +194,9 @@ impl VrmController {
         });
     }
 
-    /// Orienta o olhar (olhos, pescoço e cabeça) para uma coordenada normalizada `-1.0..=1.0`.
+    /// Orienta o olhar (olhos, pescoço e cabeça) para uma coordenada normalizada
+    /// `-1.0..=1.0`, com `+x` para a direita e `+y` para cima (convenção de tela,
+    /// não de janela).
     pub fn look_at_normalized(&self, x: f32, y: f32) {
         self.shared.lock().commands.push(VrmCommand::LookAtNormalized {
             x: x.clamp(-1.0, 1.0),
@@ -629,7 +631,8 @@ impl Render for VrmView {
 
                     if w > 1.0 && h > 1.0 {
                         let nx = (((mx - ox) / w) * 2.0 - 1.0).clamp(-1.0, 1.0);
-                        let ny = (((my - oy) / h) * 2.0 - 1.0).clamp(-1.0, 1.0);
+                        // Posição da janela cresce para baixo; o look-at usa +y para cima.
+                        let ny = (1.0 - ((my - oy) / h) * 2.0).clamp(-1.0, 1.0);
                         ctrl_for_move.look_at_normalized(nx, ny);
                     }
                 }
